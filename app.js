@@ -3,7 +3,8 @@
   const navButtons = [...document.querySelectorAll('.nav-item')];
   const views = {
     dashboard: document.getElementById('dashboard-view'),
-    'order-summary': document.getElementById('order-summary-view')
+    'order-summary': document.getElementById('order-summary-view'),
+    data: document.getElementById('data-view')
   };
   const breadcrumb = document.getElementById('breadcrumb-current');
   const configureMenuWrap = document.getElementById('configure-menu-wrap');
@@ -50,7 +51,7 @@
       if (active) button.setAttribute('aria-current', 'page');
       else button.removeAttribute('aria-current');
     });
-    const title = name === 'dashboard' ? 'Dashboard' : 'Order Summary';
+    const title = { dashboard: 'Dashboard', 'order-summary': 'Order Summary', data: 'Data' }[name];
     breadcrumb.textContent = title;
     document.title = 'Data Book | ' + title;
     if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
@@ -97,7 +98,14 @@
 
   navButtons.forEach(button => button.addEventListener('click', () => showView(button.dataset.view)));
   window.addEventListener('hashchange', () => showView(location.hash.slice(1)));
+  DataBook.data.init(showView);
   DataBook.dashboard.init(showView);
   DataBook.orderSummary.init();
-  showView(views[location.hash.slice(1)] ? location.hash.slice(1) : 'dashboard', false);
+  const authReturn = /^#(?:access_token|error)(?:=|&)/.test(location.hash);
+  if (authReturn) {
+    // Let Supabase consume its sign-in tokens before replacing the URL hash.
+    DataBook.data.ready().finally(() => showView('data', false)).catch(() => {});
+  } else {
+    showView(views[location.hash.slice(1)] ? location.hash.slice(1) : 'dashboard', false);
+  }
 })();
