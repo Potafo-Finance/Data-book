@@ -31,7 +31,7 @@
       const dateColumnSelect = document.getElementById('date-column');
       const dateSourceStatus = document.getElementById('date-source-status');
       const extensions = new Set(['xlsx', 'xls', 'xlsm', 'csv', 'tsv', 'ods']);
-      const storageKey = 'data-book.order-summary.choices.v1';
+      const legacyStorageKey = 'data-book.order-summary.choices.v1';
       const numberFormat = new Intl.NumberFormat(undefined, {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
@@ -42,6 +42,13 @@
       let sheetCache = new Map();
       let configs = [];
       let currentFileKey = null;
+      let currentFile = null;
+      let choiceDirty = false;
+      let choiceVersion = 0;
+      let pendingSave = null;
+      let saveTimer = null;
+      let saveChain = Promise.resolve();
+      const uploadedKeys = new Set();
       let journalDate = '';
       let journalDateManual = false;
       let dateSource = { sheetName: '', headerRow: 1, column: null };
@@ -68,17 +75,16 @@
         };
       }
 
-      function readSavedChoices() {
+      function readLegacyChoices(fileName) {
         try {
-          const saved = JSON.parse(window.localStorage.getItem(storageKey) || '{}');
-          return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+          const saved = JSON.parse(window.localStorage.getItem(legacyStorageKey) || '{}');
+          return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved['file:' + fileName] : null;
         } catch {
-          return {};
+          return null;
         }
       }
 
-      function restoreConfigs() {
-        const entry = readSavedChoices()[currentFileKey];
+      function restoreConfigs(entry) {
         const saved = Array.isArray(entry) ? entry : entry?.metrics;
         return metricNames.map((_, index) => {
           const stored = Array.isArray(saved) ? saved[index] : null;
@@ -102,25 +108,72 @@
         };
       }
 
+      function snapshotChoices() {
+        configs.forEach(rememberCurrentSheet);
+        return {
+          journalDate,
+          journalDateManual,
+          dateSource: { ...dateSource },
+          metrics: configs.map(config => ({
+            sheetName: config.sheetName,
+            savedBySheet: structuredClone(config.savedBySheet)
+          }))
+        };
+      }
+
+      function queuePendingSave() {
+        const save = pendingSave;
+        pendingSave = null;
+        if (!save) return;
+        saveChain = saveChain.catch(() => {}).then(async () => {
+          if (DataBook.data.user()?.id !== save.userId) return;
+          const uploadKey = save.userId + '/' + save.key;
+          const record = await DataBook.data.saveRecord({
+            module: 'order-summary', key: save.key, title: save.file.name,
+            payload: { choices: save.choices },
+            file: uploadedKeys.has(uploadKey) ? undefined : save.file
+          });
+          if (record?.file_path) uploadedKeys.add(uploadKey);
+          if (save.loadId === loadId && save.version === choiceVersion && currentFileKey === save.key) {
+            choiceDirty = false;
+            message.textContent = 'File and choices saved in Data.';
+            message.classList.remove('error');
+          }
+        }).catch(error => {
+          if (save.loadId === loadId && save.version === choiceVersion && currentFileKey === save.key) {
+            message.textContent = 'Could not save to Data: ' + (error.message || 'Please try again.');
+            message.classList.add('error');
+          }
+        });
+      }
+
+      function scheduleSave(delay = 350) {
+        if (!currentFileKey || !currentFile) return;
+        const user = DataBook.data.user();
+        if (!user) {
+          message.textContent = 'File loaded locally. Sign in from Data to save it and its choices.';
+          message.classList.remove('error');
+          return;
+        }
+        pendingSave = {
+          key: currentFileKey, file: currentFile, userId: user.id,
+          choices: snapshotChoices(), loadId, version: choiceVersion
+        };
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(queuePendingSave, delay);
+      }
+
+      function flushPendingSave() {
+        if (!pendingSave) return;
+        clearTimeout(saveTimer);
+        queuePendingSave();
+      }
+
       function saveConfigs() {
         if (!currentFileKey) return;
-        try {
-          configs.forEach(rememberCurrentSheet);
-          const saved = readSavedChoices();
-          saved[currentFileKey] = {
-            journalDate,
-            journalDateManual,
-            dateSource: { ...dateSource },
-            metrics: configs.map(config => ({
-              sheetName: config.sheetName,
-              savedBySheet: config.savedBySheet
-            }))
-          };
-          window.localStorage.setItem(storageKey, JSON.stringify(saved));
-        } catch {
-          message.textContent = 'Browser storage is unavailable, so choices cannot be saved after this page closes.';
-          message.classList.add('error');
-        }
+        choiceDirty = true;
+        choiceVersion += 1;
+        scheduleSave();
       }
 
       function make(tag, className, text) {
@@ -145,6 +198,20 @@
         if (bytes < 1024) return bytes + ' B';
         if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
         return (bytes / 1048576).toFixed(1) + ' MB';
+      }
+
+      async function fileContentKey(bytes) {
+        if (!window.crypto?.subtle) {
+          let first = 2166136261;
+          let second = 5381;
+          for (const byte of new Uint8Array(bytes)) {
+            first = Math.imul(first ^ byte, 16777619);
+            second = Math.imul(second, 33) ^ byte;
+          }
+          return 'checksum:' + bytes.byteLength + ':' + (first >>> 0).toString(16) + ':' + (second >>> 0).toString(16);
+        }
+        const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+        return 'sha256:' + [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('');
       }
 
       function dateFromParts(year, month, day) {
@@ -395,6 +462,18 @@
         const context = getDateContext();
         if (!validSheet || !stored || !Object.prototype.hasOwnProperty.call(stored, 'column')) dateSource.column = detectDateColumn(context);
         return renderDateSource();
+      }
+
+      function applyChoices(entry, fileName) {
+        const foundDate = restoreDateSource(entry);
+        const savedDate = normalizeDate(!Array.isArray(entry) && entry?.journalDate);
+        const storedSource = !Array.isArray(entry) && entry?.dateSource;
+        const explicitSource = storedSource && Object.prototype.hasOwnProperty.call(storedSource, 'column');
+        journalDateManual = Boolean(!Array.isArray(entry) && (entry?.journalDateManual === true || (!storedSource && savedDate)));
+        journalDate = journalDateManual ? savedDate : dateSource.column !== null ? foundDate : explicitSource ? '' : inferJournalDate(fileName);
+        journalDateInput.value = journalDate;
+        configs = restoreConfigs(entry);
+        renderMetrics();
       }
 
       function applyDateSourceChange() {
@@ -649,6 +728,7 @@
       }
 
       function clearData(status) {
+        flushPendingSave();
         loadId += 1;
         workbook = null;
         textRows = null;
@@ -656,6 +736,9 @@
         sheetCache = new Map();
         configs = [];
         currentFileKey = null;
+        currentFile = null;
+        choiceDirty = false;
+        choiceVersion = 0;
         journalDate = '';
         journalDateManual = false;
         dateSource = { sheetName: '', headerRow: 1, column: null };
@@ -671,16 +754,18 @@
       }
 
       async function handleFile(file) {
-        if (!file) return;
+        if (!file) return false;
         const extension = file.name.split('.').pop().toLowerCase();
         if (!extensions.has(extension)) {
           clearData('');
           message.textContent = 'Choose an XLSX, XLS, XLSM, CSV, TSV, or ODS file.';
           message.classList.add('error');
-          return;
+          return false;
         }
+        flushPendingSave();
         const request = ++loadId;
         currentFileKey = null;
+        currentFile = null;
         selectedFile.hidden = true;
         sheetWorkspace.hidden = true;
         metricValues = Array(metricNames.length).fill(null);
@@ -691,49 +776,122 @@
         message.textContent = 'Reading file...';
         message.classList.remove('error');
         try {
+          const bytes = await file.arrayBuffer();
+          const recordKey = await fileContentKey(bytes);
+          if (request !== loadId) return false;
           let nextWorkbook = null;
           let nextTextRows = null;
           if (extension === 'csv' || extension === 'tsv') {
-            nextTextRows = parseDelimited(await file.text(), extension === 'tsv' ? '\t' : ',');
+            nextTextRows = parseDelimited(new TextDecoder().decode(bytes), extension === 'tsv' ? '\t' : ',');
             if (!nextTextRows.some(hasValues)) throw new Error('This file is empty.');
           } else {
             await ensureSheetJS();
-            if (request !== loadId) return;
-            nextWorkbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+            if (request !== loadId) return false;
+            nextWorkbook = XLSX.read(bytes, { type: 'array', cellDates: true });
           }
-          if (request !== loadId) return;
+          if (request !== loadId) return false;
           const nextNames = nextWorkbook ? nextWorkbook.SheetNames : [file.name];
           if (!nextNames.length) throw new Error('This file has no sheets.');
+          let cloudError = null;
+          try {
+            await DataBook.data.ready();
+          } catch (error) {
+            cloudError = error;
+          }
+          if (request !== loadId) return false;
+          let cloudRecord = null;
+          const user = cloudError ? null : DataBook.data.user();
+          if (user) {
+            try {
+              cloudRecord = await DataBook.data.getRecord('order-summary', recordKey);
+            } catch (error) {
+              cloudError = error;
+            }
+          }
+          if (request !== loadId) return false;
           workbook = nextWorkbook;
           textRows = nextTextRows;
           sheetNames = nextNames;
           sheetCache = new Map();
-          currentFileKey = 'file:' + file.name;
-          const savedEntry = readSavedChoices()[currentFileKey];
+          currentFileKey = recordKey;
+          currentFile = file;
+          choiceDirty = false;
+          choiceVersion = 0;
+          if (user && cloudRecord?.file_path) uploadedKeys.add(user.id + '/' + recordKey);
+          const savedEntry = cloudRecord?.payload?.choices || readLegacyChoices(file.name);
           const hadSavedChoices = Boolean(savedEntry);
-          const foundDate = restoreDateSource(savedEntry);
-          const savedDate = normalizeDate(!Array.isArray(savedEntry) && savedEntry?.journalDate);
-          const storedSource = !Array.isArray(savedEntry) && savedEntry?.dateSource;
-          const explicitSource = storedSource && Object.prototype.hasOwnProperty.call(storedSource, 'column');
-          journalDateManual = Boolean(!Array.isArray(savedEntry) && (savedEntry?.journalDateManual === true || (!storedSource && savedDate)));
-          journalDate = journalDateManual ? savedDate : dateSource.column !== null ? foundDate : explicitSource ? '' : inferJournalDate(file.name);
-          journalDateInput.value = journalDate;
-          configs = restoreConfigs();
           sheetMeta.textContent = sheetNames.length + (sheetNames.length === 1 ? ' sheet' : ' sheets') + ' available · Choose a sheet in each calculation.';
           sheetWorkspace.hidden = false;
-          renderMetrics();
+          applyChoices(savedEntry, file.name);
           document.getElementById('file-name').textContent = file.name;
           document.getElementById('file-size').textContent = formatSize(file.size);
           selectedFile.hidden = false;
-          message.textContent = hadSavedChoices ? 'File loaded. Saved choices restored.' : 'File loaded. Choose columns below.';
-          saveConfigs();
+          if (cloudError) {
+            message.textContent = 'File loaded locally. Could not read Data: ' + (cloudError.message || 'Please try again.');
+            message.classList.add('error');
+          } else if (!user) {
+            message.textContent = hadSavedChoices ? 'File loaded. Previous browser choices restored. Sign in from Data to save.' : 'File loaded locally. Sign in from Data to save it and its choices.';
+          } else {
+            message.textContent = hadSavedChoices ? 'File loaded. Saved choices restored.' : 'File loaded. Choose columns below.';
+            if (!cloudRecord?.file_path) scheduleSave(0);
+          }
+          return true;
         } catch (error) {
-          if (request !== loadId) return;
+          if (request !== loadId) return false;
           clearData('');
           message.textContent = error.message || 'Could not read this file.';
           message.classList.add('error');
+          return false;
         }
       }
+
+      async function reconcileSignedInFile(user) {
+        if (!currentFile || !currentFileKey) return;
+        const request = loadId;
+        const key = currentFileKey;
+        const file = currentFile;
+        const dirtyAtStart = choiceDirty;
+        try {
+          const record = await DataBook.data.getRecord('order-summary', key);
+          if (request !== loadId || DataBook.data.user()?.id !== user.id) return;
+          if (record?.file_path) uploadedKeys.add(user.id + '/' + key);
+          if (record?.payload?.choices && !dirtyAtStart && !choiceDirty) {
+            applyChoices(record.payload.choices, file.name);
+            message.textContent = 'File loaded. Saved choices restored from Data.';
+            message.classList.remove('error');
+          } else {
+            scheduleSave(0);
+          }
+        } catch (error) {
+          if (request !== loadId) return;
+          message.textContent = 'Could not read Data: ' + (error.message || 'Please try again.');
+          message.classList.add('error');
+        }
+      }
+
+      DataBook.data.onChange(({ type, user, record }) => {
+        if (type === 'deleted' && record?.module === 'order-summary' && record.record_key === currentFileKey && user) {
+          if (pendingSave?.key === currentFileKey) {
+            clearTimeout(saveTimer);
+            pendingSave = null;
+          }
+          uploadedKeys.delete(user.id + '/' + currentFileKey);
+          return;
+        }
+        if (type !== 'auth' || !currentFile) return;
+        if (user) void reconcileSignedInFile(user);
+        else {
+          message.textContent = 'Signed out. Sign in from Data to save further changes.';
+          message.classList.remove('error');
+        }
+      });
+      DataBook.data.registerOpener('order-summary', async record => {
+        if (!record.file_path) throw new Error('This saved item has no order file.');
+        const blob = await DataBook.data.downloadFile(record);
+        const name = record.file_name || record.title || 'order-summary.csv';
+        const file = new File([blob], name, { type: blob.type });
+        if (!await handleFile(file)) throw new Error(message.textContent || 'Could not open the saved order file.');
+      });
 
       journalDateInput.addEventListener('change', () => {
         journalDate = normalizeDate(journalDateInput.value);
