@@ -43,7 +43,10 @@
       let sheetCache = new Map();
       let configs = [];
       let currentFileKey = null;
+      let currentSchemaKey = null;
       let currentFile = null;
+      let localSaveError = null;
+      let inheritedFromProfile = false;
       let choiceDirty = false;
       let choiceVersion = 0;
       let pendingSave = null;
@@ -122,6 +125,82 @@
         };
       }
 
+      function recordTime(record) {
+        const timestamp = record?.payload?.source_updated_at || record?.updated_at;
+        return Date.parse(timestamp || '') || 0;
+      }
+
+      function newerChoiceRecord(local, cloud) {
+        const localChoice = local?.payload?.choices ? local : null;
+        const cloudChoice = cloud?.payload?.choices ? cloud : null;
+        if (!localChoice) return cloudChoice;
+        if (!cloudChoice) return localChoice;
+        return recordTime(localChoice) >= recordTime(cloudChoice) ? localChoice : cloudChoice;
+      }
+
+      function saveChoicesLocally(choices, { sourceUpdatedAt = null, file = true, profile = true } = {}) {
+        if (!currentFileKey) return false;
+        try {
+          const source = sourceUpdatedAt ? { source_updated_at: sourceUpdatedAt } : {};
+          if (file) DataBook.data.saveLocalRecord({
+            module: 'order-summary', key: currentFileKey, title: currentFile.name,
+            payload: { choices, ...source }
+          });
+          if (profile && currentSchemaKey) DataBook.data.saveLocalRecord({
+            module: 'order-summary', key: currentSchemaKey, title: 'Order summary settings',
+            payload: { choices, sheetNames: [...sheetNames], ...source }
+          });
+          localSaveError = null;
+          return true;
+        } catch (error) {
+          localSaveError = error.message || 'Browser storage is unavailable.';
+          message.textContent = 'Settings could not be saved in this browser: ' + localSaveError;
+          message.classList.add('error');
+          return false;
+        }
+      }
+
+      function choicesFromProfile(record) {
+        const oldNames = record?.payload?.sheetNames;
+        if (!Array.isArray(oldNames) || oldNames.length !== sheetNames.length || !record?.payload?.choices) return null;
+        const choices = structuredClone(record.payload.choices);
+        const renamed = name => {
+          const index = oldNames.indexOf(name);
+          return index < 0 ? name : sheetNames[index];
+        };
+        if (choices.dateSource?.sheetName) choices.dateSource.sheetName = renamed(choices.dateSource.sheetName);
+        if (Array.isArray(choices.metrics)) choices.metrics.forEach(metric => {
+          if (!metric || typeof metric !== 'object') return;
+          if (metric.sheetName) metric.sheetName = renamed(metric.sheetName);
+          if (metric.savedBySheet && typeof metric.savedBySheet === 'object') {
+            metric.savedBySheet = Object.fromEntries(Object.entries(metric.savedBySheet)
+              .map(([name, state]) => [renamed(name), state]));
+          }
+        });
+        choices.journalDate = '';
+        choices.journalDateManual = false;
+        return choices;
+      }
+
+      async function schemaKeyFor(nextWorkbook, nextTextRows, nextNames) {
+        const headings = nextNames.map(name => {
+          let header;
+          if (nextWorkbook) {
+            const sheet = nextWorkbook.Sheets[name];
+            const range = sheet?.['!ref'] ? XLSX.utils.decode_range(sheet['!ref']) : null;
+            header = range ? Array.from({ length: range.e.c + 1 }, (_, index) =>
+              sheet[XLSX.utils.encode_cell({ r: 0, c: index })]?.v ?? '') : [];
+          } else header = nextTextRows[0] || [];
+          const normalized = header.map(value => String(value ?? '').normalize('NFKC')
+            .trim().replace(/\s+/g, ' ').toLowerCase());
+          while (normalized.length && !normalized[normalized.length - 1]) normalized.pop();
+          return normalized;
+        });
+        if (headings.some(header => !header.some(Boolean))) return null;
+        const bytes = new TextEncoder().encode(JSON.stringify({ version: 1, headings }));
+        return 'settings:' + await fileContentKey(bytes);
+      }
+
       function queuePendingSave() {
         const save = pendingSave;
         pendingSave = null;
@@ -135,14 +214,23 @@
             file: uploadedKeys.has(uploadKey) ? undefined : save.file
           });
           if (record?.file_path) uploadedKeys.add(uploadKey);
+          if (save.schemaKey) await DataBook.data.saveRecord({
+            module: 'order-summary', key: save.schemaKey, title: 'Order summary settings',
+            payload: { choices: save.choices, sheetNames: save.sheetNames }
+          });
           if (save.loadId === loadId && save.version === choiceVersion && currentFileKey === save.key) {
             choiceDirty = false;
-            message.textContent = 'File and choices saved in Data.';
-            message.classList.remove('error');
+            const browserSaved = Boolean(DataBook.data.getLocalRecord('order-summary', save.key)?.payload?.choices);
+            message.textContent = localSaveError
+              ? 'File and settings saved in Data, but browser storage failed: ' + localSaveError
+              : browserSaved ? 'File and settings saved in Data and this browser.' : 'File and settings saved in Data.';
+            message.classList.toggle('error', Boolean(localSaveError));
           }
         }).catch(error => {
           if (save.loadId === loadId && save.version === choiceVersion && currentFileKey === save.key) {
-            message.textContent = 'Could not save to Data: ' + (error.message || 'Please try again.');
+            const browserSaved = Boolean(DataBook.data.getLocalRecord('order-summary', save.key)?.payload?.choices);
+            message.textContent = (localSaveError ? 'Browser storage also failed: ' + localSaveError + ' ' : browserSaved ? 'Settings saved in this browser. ' : '')
+              + 'Could not sync to Data: ' + (error.message || 'Please try again.');
             message.classList.add('error');
           }
         });
@@ -152,12 +240,15 @@
         if (!currentFileKey || !currentFile) return;
         const user = DataBook.data.user();
         if (!user) {
-          message.textContent = 'File loaded locally. Sign in from Data to save it and its choices.';
-          message.classList.remove('error');
+          if (!localSaveError) {
+            message.textContent = 'Settings saved in this browser. Sign in from Data to sync the file and settings.';
+            message.classList.remove('error');
+          }
           return;
         }
         pendingSave = {
           key: currentFileKey, file: currentFile, userId: user.id,
+          schemaKey: currentSchemaKey, sheetNames: [...sheetNames],
           choices: snapshotChoices(), loadId, version: choiceVersion
         };
         clearTimeout(saveTimer);
@@ -174,6 +265,8 @@
         if (!currentFileKey) return;
         choiceDirty = true;
         choiceVersion += 1;
+        inheritedFromProfile = false;
+        saveChoicesLocally(snapshotChoices());
         scheduleSave();
       }
 
@@ -480,13 +573,14 @@
         return renderDateSource();
       }
 
-      function applyChoices(entry, fileName) {
+      function applyChoices(entry, fileName, inherited = false) {
         const foundDate = restoreDateSource(entry);
         const savedDate = normalizeDate(!Array.isArray(entry) && entry?.journalDate);
         const storedSource = !Array.isArray(entry) && entry?.dateSource;
         const explicitSource = storedSource && Object.prototype.hasOwnProperty.call(storedSource, 'column');
-        journalDateManual = Boolean(!Array.isArray(entry) && (entry?.journalDateManual === true || (!storedSource && savedDate)));
-        journalDate = journalDateManual ? savedDate : dateSource.column !== null ? foundDate : explicitSource ? '' : inferJournalDate(fileName);
+        journalDateManual = !inherited && Boolean(!Array.isArray(entry) && (entry?.journalDateManual === true || (!storedSource && savedDate)));
+        journalDate = journalDateManual ? savedDate : inherited ? foundDate || inferJournalDate(fileName)
+          : dateSource.column !== null ? foundDate : explicitSource ? '' : inferJournalDate(fileName);
         journalDateInput.value = journalDate;
         configs = restoreConfigs(entry);
         renderMetrics();
@@ -752,7 +846,10 @@
         sheetCache = new Map();
         configs = [];
         currentFileKey = null;
+        currentSchemaKey = null;
         currentFile = null;
+        localSaveError = null;
+        inheritedFromProfile = false;
         choiceDirty = false;
         choiceVersion = 0;
         journalDate = '';
@@ -781,7 +878,10 @@
         flushPendingSave();
         const request = ++loadId;
         currentFileKey = null;
+        currentSchemaKey = null;
         currentFile = null;
+        localSaveError = null;
+        inheritedFromProfile = false;
         selectedFile.hidden = true;
         sheetWorkspace.hidden = true;
         metricValues = Array(metricNames.length).fill(null);
@@ -808,6 +908,10 @@
           if (request !== loadId) return false;
           const nextNames = nextWorkbook ? nextWorkbook.SheetNames : [file.name];
           if (!nextNames.length) throw new Error('This file has no sheets.');
+          const schemaKey = await schemaKeyFor(nextWorkbook, nextTextRows, nextNames);
+          if (request !== loadId) return false;
+          const localFileRecord = DataBook.data.getLocalRecord('order-summary', recordKey);
+          const localProfileRecord = schemaKey ? DataBook.data.getLocalRecord('order-summary', schemaKey) : null;
           let cloudError = null;
           try {
             await DataBook.data.ready();
@@ -816,13 +920,16 @@
           }
           if (request !== loadId) return false;
           let cloudRecord = null;
+          let cloudProfileRecord = null;
           const user = cloudError ? null : DataBook.data.user();
           if (user) {
-            try {
-              cloudRecord = await DataBook.data.getRecord('order-summary', recordKey);
-            } catch (error) {
-              cloudError = error;
-            }
+            const requests = [DataBook.data.getRecord('order-summary', recordKey)];
+            if (schemaKey) requests.push(DataBook.data.getRecord('order-summary', schemaKey));
+            const results = await Promise.allSettled(requests);
+            if (results[0].status === 'fulfilled') cloudRecord = results[0].value;
+            else cloudError = results[0].reason;
+            if (results[1]?.status === 'fulfilled') cloudProfileRecord = results[1].value;
+            else if (results[1]?.status === 'rejected') cloudError ||= results[1].reason;
           }
           if (request !== loadId) return false;
           workbook = nextWorkbook;
@@ -830,26 +937,52 @@
           sheetNames = nextNames;
           sheetCache = new Map();
           currentFileKey = recordKey;
+          currentSchemaKey = schemaKey;
           currentFile = file;
           choiceDirty = false;
           choiceVersion = 0;
           if (user && cloudRecord?.file_path) uploadedKeys.add(user.id + '/' + recordKey);
-          const savedEntry = cloudRecord?.payload?.choices || readLegacyChoices(file.name);
+          const fileRecord = newerChoiceRecord(localFileRecord, cloudRecord);
+          const profileRecord = newerChoiceRecord(localProfileRecord, cloudProfileRecord);
+          const legacyChoices = fileRecord ? null : readLegacyChoices(file.name);
+          const inheritedChoices = !fileRecord && !legacyChoices ? choicesFromProfile(profileRecord) : null;
+          const savedEntry = fileRecord?.payload?.choices || legacyChoices || inheritedChoices;
+          const inherited = Boolean(inheritedChoices);
+          inheritedFromProfile = inherited;
           const hadSavedChoices = Boolean(savedEntry);
           sheetMeta.textContent = sheetNames.length + (sheetNames.length === 1 ? ' sheet' : ' sheets') + ' available · Choose a sheet in each calculation.';
           sheetWorkspace.hidden = false;
-          applyChoices(savedEntry, file.name);
+          applyChoices(savedEntry, file.name, inherited);
+          if (hadSavedChoices && (fileRecord !== localFileRecord || inherited || legacyChoices)) {
+            const source = fileRecord || (inherited ? profileRecord : null);
+            const sourceUpdatedAt = source?.payload?.source_updated_at || source?.updated_at || null;
+            const updateProfile = !profileRecord || inherited || !source || recordTime(source) >= recordTime(profileRecord);
+            saveChoicesLocally(snapshotChoices(), { sourceUpdatedAt, profile: updateProfile });
+          } else if (hadSavedChoices && !localProfileRecord && schemaKey) {
+            saveChoicesLocally(snapshotChoices(), {
+              sourceUpdatedAt: localFileRecord?.payload?.source_updated_at || localFileRecord?.updated_at || null,
+              file: false
+            });
+          }
           document.getElementById('file-name').textContent = file.name;
           document.getElementById('file-size').textContent = formatSize(file.size);
           selectedFile.hidden = false;
-          if (cloudError) {
-            message.textContent = 'File loaded locally. Could not read Data: ' + (cloudError.message || 'Please try again.');
+          if (localSaveError) {
+            message.textContent = 'File loaded, but settings could not be saved in this browser: ' + localSaveError;
+            message.classList.add('error');
+          } else if (cloudError) {
+            message.textContent = 'File loaded. Could not read Data; browser settings remain available: ' + (cloudError.message || 'Please try again.');
             message.classList.add('error');
           } else if (!user) {
-            message.textContent = hadSavedChoices ? 'File loaded. Previous browser choices restored. Sign in from Data to save.' : 'File loaded locally. Sign in from Data to save it and its choices.';
+            message.textContent = hadSavedChoices
+              ? 'File loaded. Saved settings restored. Sign in from Data to sync the file and settings.'
+              : 'File loaded. Changes to settings will be saved in this browser.';
           } else {
-            message.textContent = hadSavedChoices ? 'File loaded. Saved choices restored.' : 'File loaded. Choose columns below.';
-            if (!cloudRecord?.file_path) scheduleSave(0);
+            message.textContent = hadSavedChoices ? 'File loaded. Saved settings restored.' : 'File loaded. Choose columns below.';
+            const localFileNewer = localFileRecord?.payload?.choices && recordTime(localFileRecord) > recordTime(cloudRecord);
+            const localProfileNewer = localProfileRecord?.payload?.choices && recordTime(localProfileRecord) > recordTime(cloudProfileRecord);
+            if (!cloudRecord?.file_path || !cloudRecord?.payload?.choices || localFileNewer ||
+              (schemaKey && hadSavedChoices && (!cloudProfileRecord?.payload?.choices || localProfileNewer || inherited))) scheduleSave(0);
           }
           return true;
         } catch (error) {
@@ -868,19 +1001,52 @@
         const file = currentFile;
         const dirtyAtStart = choiceDirty;
         try {
-          const record = await DataBook.data.getRecord('order-summary', key);
+          const requests = [DataBook.data.getRecord('order-summary', key)];
+          if (currentSchemaKey) requests.push(DataBook.data.getRecord('order-summary', currentSchemaKey));
+          const results = await Promise.allSettled(requests);
+          const failed = results.find(result => result.status === 'rejected');
+          if (failed) throw failed.reason;
+          const record = results[0].value;
+          const profile = results[1]?.value || null;
           if (request !== loadId || DataBook.data.user()?.id !== user.id) return;
           if (record?.file_path) uploadedKeys.add(user.id + '/' + key);
-          if (record?.payload?.choices && !dirtyAtStart && !choiceDirty) {
+          const localFile = DataBook.data.getLocalRecord('order-summary', key);
+          const localProfile = currentSchemaKey ? DataBook.data.getLocalRecord('order-summary', currentSchemaKey) : null;
+          const remoteFileIsNewer = record?.payload?.choices &&
+            recordTime(record) > recordTime(localFile);
+          const remoteProfileIsNewer = profile?.payload?.choices &&
+            (!localFile?.payload?.choices || inheritedFromProfile) &&
+            recordTime(profile) > recordTime(localFile);
+          if (!dirtyAtStart && !choiceDirty && remoteFileIsNewer) {
             applyChoices(record.payload.choices, file.name);
-            message.textContent = 'File loaded. Saved choices restored from Data.';
-            message.classList.remove('error');
-          } else {
-            scheduleSave(0);
+            inheritedFromProfile = false;
+            saveChoicesLocally(snapshotChoices(), {
+              sourceUpdatedAt: record.updated_at,
+              profile: !profile || recordTime(record) >= recordTime(profile)
+            });
+            message.textContent = localSaveError ? 'Settings restored from Data, but browser storage failed: ' + localSaveError
+              : 'File loaded. Saved settings restored from Data.';
+            message.classList.toggle('error', Boolean(localSaveError));
+          } else if (!dirtyAtStart && !choiceDirty && remoteProfileIsNewer) {
+            const inherited = choicesFromProfile(profile);
+            if (inherited) {
+              applyChoices(inherited, file.name, true);
+              inheritedFromProfile = true;
+              saveChoicesLocally(snapshotChoices(), { sourceUpdatedAt: profile.updated_at });
+              message.textContent = localSaveError ? 'Settings restored from Data, but browser storage failed: ' + localSaveError
+                : 'File loaded. Settings restored from Data.';
+              message.classList.toggle('error', Boolean(localSaveError));
+            }
           }
+          const latestLocalFile = DataBook.data.getLocalRecord('order-summary', key);
+          const latestLocalProfile = currentSchemaKey ? DataBook.data.getLocalRecord('order-summary', currentSchemaKey) : null;
+          if (choiceDirty || !record?.file_path || !record?.payload?.choices ||
+            recordTime(latestLocalFile) > recordTime(record) ||
+            (currentSchemaKey && (!profile?.payload?.choices || recordTime(latestLocalProfile) > recordTime(profile)))) scheduleSave(0);
         } catch (error) {
           if (request !== loadId) return;
-          message.textContent = 'Could not read Data: ' + (error.message || 'Please try again.');
+          message.textContent = (localSaveError ? 'Browser storage also failed: ' + localSaveError + ' ' : 'Settings remain saved in this browser. ')
+            + 'Could not read Data: ' + (error.message || 'Please try again.');
           message.classList.add('error');
         }
       }
@@ -897,8 +1063,9 @@
         if (type !== 'auth' || !currentFile) return;
         if (user) void reconcileSignedInFile(user);
         else {
-          message.textContent = 'Signed out. Sign in from Data to save further changes.';
-          message.classList.remove('error');
+          message.textContent = localSaveError ? 'Signed out. Browser storage failed: ' + localSaveError
+            : 'Signed out. Settings changes will be saved in this browser.';
+          message.classList.toggle('error', Boolean(localSaveError));
         }
       });
       DataBook.data.registerOpener('order-summary', async record => {
