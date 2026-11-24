@@ -276,6 +276,9 @@
     .journal-status { min-height: 20px; margin: 0; padding: 14px 24px 17px; border-top: 1px solid #edf1f6; color: #66758c; font-size: .8rem; }
     .journal-status.is-balanced { color: #25805b; }
     .journal-status.is-unbalanced { color: #a25235; }
+    .journal-order-count { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 18px 24px; border: 1px solid #e2e9f2; border-radius: 14px; background: #fff; box-shadow: 0 8px 26px rgba(25, 48, 82, .04); }
+    .journal-order-count span { color: #526688; font-size: .86rem; font-weight: 700; }
+    .journal-order-count strong { color: #18243a; font-size: 1.35rem; font-variant-numeric: tabular-nums; font-weight: 800; }
     .journal-table tbody tr:nth-child(n+3) th { padding-left: 40px; }
     #difference-row { background: #fffaf1; }
     #difference-row th { color: #825b27; }
@@ -555,6 +558,10 @@
             </div>
             <p class="journal-status" id="journal-status" role="status" aria-live="polite">Upload a file to calculate the entry.</p>
           </section>
+          <div class="journal-order-count">
+            <span>No. of Orders</span>
+            <strong id="journal-order-count" role="status" aria-live="polite">—</strong>
+          </div>
 
         </section>
       </main>
