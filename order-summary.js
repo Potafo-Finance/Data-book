@@ -21,6 +21,7 @@
       const journalDebitTotal = document.getElementById('journal-debit-total');
       const journalCreditTotal = document.getElementById('journal-credit-total');
       const journalStatus = document.getElementById('journal-status');
+      const journalOrderCount = document.getElementById('journal-order-count');
       const differenceRow = document.getElementById('difference-row');
       const differenceParticulars = document.getElementById('difference-particulars');
       const differenceSide = document.getElementById('difference-side');
@@ -244,6 +245,8 @@
       function renderJournal() {
         journalDateInput.disabled = !currentFileKey;
         journalDateCell.textContent = journalDate ? journalDate.slice(8, 10) + '/' + journalDate.slice(5, 7) + '/' + journalDate.slice(0, 4) : '—';
+        const orderCount = countOrdersForDate();
+        journalOrderCount.textContent = orderCount === null ? '—' : String(orderCount);
         metricValues.forEach((value, index) => {
           document.getElementById('summary-total-' + index).textContent = value === null ? '—' : numberFormat.format(value);
         });
@@ -398,6 +401,19 @@
         });
         if (dateSource.column !== null && (!Number.isInteger(dateSource.column) || dateSource.column < 0 || dateSource.column >= columns.length)) dateSource.column = null;
         return { rows, columns, dataRows: rows.slice(dateSource.headerRow).filter(hasValues) };
+      }
+
+      function countOrdersForDate() {
+        if (!currentFileKey || !journalDate || !sheetNames.includes(dateSource.sheetName) || dateSource.column === null) return null;
+        const context = getDateContext();
+        if (!context.columns[dateSource.column]) return null;
+        const matchingRows = context.dataRows.filter(row => normalizeDate(row[dateSource.column]) === journalDate);
+        const headings = context.columns.map(column => column.heading.toLowerCase().replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim());
+        const orderColumns = ['order number', 'order no', 'order num', 'order id']
+          .map(name => headings.indexOf(name)).filter(index => index >= 0);
+        const completeColumn = orderColumns.find(index => matchingRows.every(row => String(row[index] ?? '').trim() !== ''));
+        if (completeColumn === undefined) return matchingRows.length;
+        return new Set(matchingRows.map(row => String(row[completeColumn]).trim())).size;
       }
 
       function detectDateColumn(context) {
