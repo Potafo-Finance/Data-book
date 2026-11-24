@@ -5,6 +5,7 @@
   const publishableKey = 'sb_publishable_Lbpi0VU-OLD38KQMCKHAHQ_JlrV1I79';
   const tableName = 'app_data';
   const bucketName = 'data-book-files';
+  const localRecordsKey = 'data-book.local-records.v1';
   const redirectTo = 'https://databook-gamma.vercel.app/order-summary.html';
 
   let client = null;
@@ -97,7 +98,7 @@
       const detailsText = [record.module, formatDate(record.updated_at), record.file_size !== null ? formatSize(record.file_size) : ''].filter(Boolean).join(' · ');
       details.append(element('p', 'data-item-meta', detailsText));
       const actions = element('div', 'data-actions');
-      if (openers.has(record.module)) {
+      if (record.file_path && openers.has(record.module)) {
         const openButton = element('button', 'data-button', 'Open');
         openButton.type = 'button';
         openButton.addEventListener('click', async () => {
@@ -275,6 +276,61 @@
     }
   }
 
+  function readLocalRecords() {
+    let parsed;
+    try {
+      parsed = JSON.parse(window.localStorage.getItem(localRecordsKey) || '{}');
+    } catch {
+      return Object.create(null);
+    }
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed : Object.create(null);
+  }
+
+  function localIdentity(module, key) {
+    validateIdentity(module, key);
+    return JSON.stringify([module, key]);
+  }
+
+  function getLocalRecord(module, key) {
+    const identity = localIdentity(module, key);
+    const records = readLocalRecords();
+    const record = Object.prototype.hasOwnProperty.call(records, identity) ? records[identity] : null;
+    return record && record.module === module && record.record_key === key ? record : null;
+  }
+
+  function listLocalRecords(module) {
+    if (module !== undefined) validateIdentity(module, 'list');
+    return Object.values(readLocalRecords())
+      .filter(record => record && typeof record === 'object'
+        && (module === undefined || record.module === module)
+        && typeof record.record_key === 'string')
+      .sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')));
+  }
+
+  function saveLocalRecord({ module, key, title = '', payload = {} }) {
+    const identity = localIdentity(module, key);
+    let safePayload;
+    try {
+      safePayload = JSON.parse(JSON.stringify(payload));
+    } catch {
+      throw new Error('Settings could not be saved because their data is invalid.');
+    }
+    const record = {
+      module, record_key: key, title: String(title), payload: safePayload,
+      updated_at: new Date().toISOString()
+    };
+    try {
+      const records = readLocalRecords();
+      records[identity] = record;
+      window.localStorage.setItem(localRecordsKey, JSON.stringify(records));
+    } catch {
+      throw new Error('Browser storage is unavailable, so settings cannot be remembered here.');
+    }
+    notify('local', record);
+    return record;
+  }
+
   async function getRecord(module, key) {
     validateIdentity(module, key);
     const owner = await requireUser();
@@ -439,6 +495,7 @@
 
   DataBook.data = {
     init, ready, user: () => currentUser, onChange, getRecord, listRecords,
-    saveRecord, downloadFile, deleteRecord, registerOpener
+    saveRecord, downloadFile, deleteRecord, registerOpener,
+    getLocalRecord, listLocalRecords, saveLocalRecord
   };
 })();
